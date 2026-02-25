@@ -1,0 +1,584 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>增量同步与补偿闭环设计</title>
+  <style>
+    :root {
+      --bg: #f6f8fb;
+      --card: #ffffff;
+      --text: #0f172a;
+      --muted: #475569;
+      --border: #dbe2ea;
+      --accent: #0b5fff;
+      --ok: #0a7a37;
+      --warn: #915300;
+      --err: #b42318;
+      --code: #0b1020;
+      --code-bg: #f2f5fb;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px;
+      background: radial-gradient(circle at 0 0, #eff5ff 0, var(--bg) 50%);
+      color: var(--text);
+      font: 14px/1.55 "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif;
+    }
+    .wrap {
+      max-width: 1180px;
+      margin: 0 auto;
+      display: grid;
+      gap: 14px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      box-shadow: 0 1px 2px rgba(2, 6, 23, 0.05);
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 24px;
+      letter-spacing: 0.2px;
+    }
+    h2 {
+      margin: 0 0 10px;
+      font-size: 18px;
+      border-left: 4px solid var(--accent);
+      padding-left: 8px;
+    }
+    h3 {
+      margin: 14px 0 8px;
+      font-size: 15px;
+    }
+    p { margin: 6px 0; }
+    ul, ol { margin: 8px 0 8px 20px; }
+    li { margin: 4px 0; }
+    code {
+      background: var(--code-bg);
+      color: var(--code);
+      border: 1px solid #e1e8f2;
+      border-radius: 6px;
+      padding: 1px 5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    pre {
+      margin: 10px 0;
+      padding: 12px;
+      background: var(--code-bg);
+      border: 1px solid #e1e8f2;
+      border-radius: 8px;
+      overflow: auto;
+      color: var(--code);
+      font-size: 12px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 8px 0 12px;
+      font-size: 13px;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f8fbff;
+      font-weight: 600;
+    }
+    .tag {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: #f8fbff;
+      margin-right: 6px;
+    }
+    .ok { color: var(--ok); font-weight: 600; }
+    .warn { color: var(--warn); font-weight: 600; }
+    .err { color: var(--err); font-weight: 600; }
+    .muted { color: var(--muted); }
+    .grid2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    @media (max-width: 960px) {
+      .grid2 { grid-template-columns: 1fr; }
+    }
+  </style>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, securityLevel: "loose", theme: "neutral" });
+  </script>
+</head>
+<body>
+  <div class="wrap">
+    <section class="card">
+      <h1>增量同步与补偿闭环设计</h1>
+      <p>目标：实现上游 API 到本地数据库的自动增量同步，支持多实例并发安全、状态可收敛、失败可追溯与人工补偿。</p>
+      <p>
+        冻结决策：
+        <span class="tag">Redis 分布式锁 + fencing token</span>
+        <span class="tag">消费端二次查询（lastId 分页）</span>
+        <span class="tag">部分成功允许推进 checkpoint</span>
+        <span class="tag">失败以人工重放为主</span>
+        <span class="tag">系统失败可归档关闭</span>
+      </p>
+    </section>
+
+    <section class="card" id="background">
+      <h2>背景</h2>
+      <ul>
+        <li>上游接口按 <code>id</code> 升序，固定 <code>curPage=1</code>，通过 <code>lastId</code> 向后推进。</li>
+        <li>每次调用都必须传入 <code>startDate</code> 和 <code>endDate</code>。</li>
+        <li>生产端先落明细快照，再发送 MQ；消费端按参数回查上游并落业务表，再更新明细状态。</li>
+        <li>多实例消费存在乱序，不能依赖“最后批次消息”判断最终状态。</li>
+      </ul>
+    </section>
+
+    <section class="card" id="constraints">
+      <h2>约束</h2>
+      <ul>
+        <li>同一任务同一时刻仅允许一个生产者活跃；活跃 run 心跳在 1 小时内时跳过新触发。</li>
+        <li>常规增量起点看 <code>sync_task_checkpoint</code>；若存在超时未完成 run，则优先按 runlog 断点续跑。</li>
+        <li><code>endBatch</code> 仅提示，不参与终态收敛。</li>
+        <li>消费幂等键为 <code>(runId, batchNo, sourceId)</code>，实体写入用业务唯一键 upsert。</li>
+        <li>失败池必须可查询、可重放、可归档且可审计。</li>
+      </ul>
+    </section>
+
+    <section class="card" id="state-machine">
+      <h2>状态机</h2>
+      <div class="grid2">
+        <div>
+          <h3>Run 状态机</h3>
+          <div class="mermaid">
+stateDiagram-v2
+  [*] --> STARTED
+  STARTED --> RUNNING: "进入生产或消费阶段"
+  RUNNING --> SUCCESS: "produce=PRODUCED 且 pending=0 且 validationFail=0 且 systemFail=0"
+  RUNNING --> PARTIAL_SUCCESS: "produce=PRODUCED 且 pending=0 且 (validationFail>0 或 systemFail>0)"
+  STARTED --> FAILED: "生产阶段不可恢复失败"
+  RUNNING --> FAILED: "接管失败或不可恢复异常"
+          </div>
+        </div>
+        <div>
+          <h3>明细状态机</h3>
+          <div class="mermaid">
+stateDiagram-v2
+  [*] --> INIT
+  INIT --> CONSUMING: "批次被消费"
+  CONSUMING --> SUCCESS: "业务入库成功"
+  CONSUMING --> VALIDATION_FAILED: "业务校验失败"
+  CONSUMING --> SYSTEM_FAILED: "技术异常失败"
+  VALIDATION_FAILED --> CONSUMING: "人工重放"
+  SYSTEM_FAILED --> CONSUMING: "人工重放"
+  SYSTEM_FAILED --> ARCHIVED_CLOSED: "人工归档关闭"
+          </div>
+        </div>
+      </div>
+
+      <h3>终态布尔判定（权威规则）</h3>
+      <pre><code>can_finalize = (produce_status == 'PRODUCED') AND (pending_count == 0)
+
+if can_finalize AND validation_fail_count == 0 AND system_fail_count == 0:
+    run_status = 'SUCCESS'
+
+if can_finalize AND (validation_fail_count > 0 OR system_fail_count > 0):
+    run_status = 'PARTIAL_SUCCESS'
+
+if produce_status == 'PRODUCE_FAILED' AND unrecoverable == true:
+    run_status = 'FAILED'</code></pre>
+    </section>
+
+    <section class="card" id="data-model">
+      <h2>数据模型</h2>
+
+      <h3>表：<code>sync_task_checkpoint</code></h3>
+      <table>
+        <thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>task_id</td><td>BIGINT（64位整数）</td><td>任务 ID，主键，每个任务仅一行</td></tr>
+          <tr><td>committed_start_date</td><td>DATETIME（日期时间）</td><td>当前已提交窗口开始时间</td></tr>
+          <tr><td>committed_end_date</td><td>DATETIME（日期时间）</td><td>当前已提交窗口结束时间</td></tr>
+          <tr><td>committed_last_id</td><td>BIGINT（64位整数）</td><td>当前已提交的最大上游 ID</td></tr>
+          <tr><td>checkpoint_version</td><td>BIGINT（64位整数）</td><td>CAS 版本号，用于并发更新保护</td></tr>
+          <tr><td>updated_at</td><td>DATETIME（日期时间）</td><td>更新时间</td></tr>
+        </tbody>
+      </table>
+      <p class="muted">索引：主键 <code>PK(task_id)</code>。</p>
+
+      <h3>表：<code>sync_task_run_log</code></h3>
+      <table>
+        <thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGINT（64位整数）</td><td>运行记录 ID，主键</td></tr>
+          <tr><td>task_id</td><td>BIGINT（64位整数）</td><td>任务 ID</td></tr>
+          <tr><td>window_start_date</td><td>DATETIME（日期时间）</td><td>本次增量窗口开始</td></tr>
+          <tr><td>window_end_date</td><td>DATETIME（日期时间）</td><td>本次增量窗口结束</td></tr>
+          <tr><td>query_param_snapshot</td><td>JSON（结构化文本）</td><td>本次查询参数快照（startDate/endDate/pageSize/初始lastId）</td></tr>
+          <tr><td>resume_last_id</td><td>BIGINT（64位整数）</td><td>生产断点 ID，续跑时作为 lastId 起点</td></tr>
+          <tr><td>resume_batch_no</td><td>INT（32位整数）</td><td>生产断点批次号，续跑时从下一批继续</td></tr>
+          <tr><td>resume_mode</td><td>VARCHAR(16)（字符串）</td><td>NEW|RESUME，标识是新跑还是断点续跑</td></tr>
+          <tr><td>interrupted_reason</td><td>VARCHAR(512)（字符串）</td><td>中断原因（超时/实例下线/异常）</td></tr>
+          <tr><td>run_status</td><td>VARCHAR(32)（字符串）</td><td>STARTED|RUNNING|SUCCESS|PARTIAL_SUCCESS|FAILED</td></tr>
+          <tr><td>produce_status</td><td>VARCHAR(32)（字符串）</td><td>INIT|PRODUCING|PRODUCED|PRODUCE_FAILED</td></tr>
+          <tr><td>consume_status</td><td>VARCHAR(32)（字符串）</td><td>INIT|CONSUMING|DONE|PARTIAL|FAILED</td></tr>
+          <tr><td>owner_instance</td><td>VARCHAR(128)（字符串）</td><td>生产端实例标识</td></tr>
+          <tr><td>lock_token</td><td>VARCHAR(128)（字符串）</td><td>fencing token，防止旧实例写入</td></tr>
+          <tr><td>heartbeat_time</td><td>DATETIME（日期时间）</td><td>心跳时间，用于活跃判定</td></tr>
+          <tr><td>expected_batch_count</td><td>INT（32位整数）</td><td>预期批次数</td></tr>
+          <tr><td>finished_batch_count</td><td>INT（32位整数）</td><td>已完成批次数</td></tr>
+          <tr><td>expected_detail_count</td><td>BIGINT（64位整数）</td><td>预期明细数</td></tr>
+          <tr><td>success_count</td><td>BIGINT（64位整数）</td><td>明细成功数</td></tr>
+          <tr><td>validation_fail_count</td><td>BIGINT（64位整数）</td><td>校验失败数</td></tr>
+          <tr><td>system_fail_count</td><td>BIGINT（64位整数）</td><td>系统失败数</td></tr>
+          <tr><td>pending_count</td><td>BIGINT（64位整数）</td><td>待处理数（INIT/CONSUMING）</td></tr>
+          <tr><td>trigger_type</td><td>VARCHAR(16)（字符串）</td><td>AUTO|MANUAL|RECOVER</td></tr>
+          <tr><td>created_at</td><td>DATETIME（日期时间）</td><td>创建时间</td></tr>
+          <tr><td>updated_at</td><td>DATETIME（日期时间）</td><td>更新时间</td></tr>
+        </tbody>
+      </table>
+      <p class="muted">索引：<code>(task_id, run_status, updated_at)</code>，<code>(task_id, heartbeat_time)</code>，<code>(task_id, produce_status, heartbeat_time)</code>。</p>
+
+      <h3>表：<code>sync_run_batch</code></h3>
+      <table>
+        <thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGINT（64位整数）</td><td>批次 ID，主键</td></tr>
+          <tr><td>run_id</td><td>BIGINT（64位整数）</td><td>运行记录 ID</td></tr>
+          <tr><td>task_id</td><td>BIGINT（64位整数）</td><td>任务 ID</td></tr>
+          <tr><td>batch_no</td><td>INT（32位整数）</td><td>批次序号（顺序语义）</td></tr>
+          <tr><td>start_date</td><td>DATETIME（日期时间）</td><td>批次查询开始时间</td></tr>
+          <tr><td>end_date</td><td>DATETIME（日期时间）</td><td>批次查询结束时间</td></tr>
+          <tr><td>last_id_from</td><td>BIGINT（64位整数）</td><td>本批查询入参的 lastId</td></tr>
+          <tr><td>last_id_to</td><td>BIGINT（64位整数）</td><td>本批快照上界 ID</td></tr>
+          <tr><td>expected_count</td><td>INT（32位整数）</td><td>本批预期明细数</td></tr>
+          <tr><td>batch_status</td><td>VARCHAR(32)（字符串）</td><td>CREATED|ENQUEUED|CONSUMING|DONE|PARTIAL|FAILED</td></tr>
+          <tr><td>msg_key</td><td>VARCHAR(128)（字符串）</td><td>消息幂等键</td></tr>
+          <tr><td>attempt_no</td><td>INT（32位整数）</td><td>发送尝试次数</td></tr>
+          <tr><td>created_at</td><td>DATETIME（日期时间）</td><td>创建时间</td></tr>
+          <tr><td>updated_at</td><td>DATETIME（日期时间）</td><td>更新时间</td></tr>
+        </tbody>
+      </table>
+      <p class="muted">唯一索引：<code>UK(run_id, batch_no)</code>；普通索引：<code>(task_id, batch_status)</code>。</p>
+
+      <h3>表：<code>sync_run_detail</code></h3>
+      <table>
+        <thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>id</td><td>BIGINT（64位整数）</td><td>明细 ID，主键</td></tr>
+          <tr><td>run_id</td><td>BIGINT（64位整数）</td><td>运行记录 ID</td></tr>
+          <tr><td>batch_id</td><td>BIGINT（64位整数）</td><td>批次 ID</td></tr>
+          <tr><td>task_id</td><td>BIGINT（64位整数）</td><td>任务 ID</td></tr>
+          <tr><td>source_id</td><td>BIGINT（64位整数）</td><td>上游主键 ID</td></tr>
+          <tr><td>entity_id</td><td>BIGINT（64位整数，可空）</td><td>本地业务实体主键</td></tr>
+          <tr><td>detail_status</td><td>VARCHAR(32)（字符串）</td><td>INIT|CONSUMING|SUCCESS|VALIDATION_FAILED|SYSTEM_FAILED|ARCHIVED_CLOSED</td></tr>
+          <tr><td>fail_code</td><td>VARCHAR(64)（字符串）</td><td>失败编码</td></tr>
+          <tr><td>fail_reason</td><td>VARCHAR(1024)（字符串）</td><td>失败原因</td></tr>
+          <tr><td>replay_count</td><td>INT（32位整数）</td><td>人工重放次数</td></tr>
+          <tr><td>last_replay_time</td><td>DATETIME（日期时间）</td><td>最近重放时间</td></tr>
+          <tr><td>created_at</td><td>DATETIME（日期时间）</td><td>创建时间</td></tr>
+          <tr><td>updated_at</td><td>DATETIME（日期时间）</td><td>更新时间</td></tr>
+        </tbody>
+      </table>
+      <p class="muted">唯一索引：<code>UK(run_id, source_id)</code>；普通索引：<code>(task_id, detail_status, updated_at)</code>，<code>(run_id, detail_status)</code>。</p>
+
+      <h3>表：<code>sync_detail_archive</code></h3>
+      <table>
+        <thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>archive_id</td><td>BIGINT（64位整数）</td><td>归档记录 ID，主键</td></tr>
+          <tr><td>detail_id</td><td>BIGINT（64位整数）</td><td>明细 ID</td></tr>
+          <tr><td>task_id</td><td>BIGINT（64位整数）</td><td>任务 ID</td></tr>
+          <tr><td>run_id</td><td>BIGINT（64位整数）</td><td>运行记录 ID</td></tr>
+          <tr><td>source_id</td><td>BIGINT（64位整数）</td><td>上游主键 ID</td></tr>
+          <tr><td>archive_reason</td><td>VARCHAR(512)（字符串）</td><td>归档关闭原因</td></tr>
+          <tr><td>archived_at</td><td>DATETIME（日期时间）</td><td>归档时间</td></tr>
+          <tr><td>operator</td><td>VARCHAR(128)（字符串）</td><td>操作人</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="card" id="main-flow">
+      <h2>主流程图</h2>
+      <div class="mermaid">
+flowchart TD
+  A["调度触发"] --> B["获取 Redis 锁与 fencing token"]
+  B --> C{"存在活跃 run 且心跳小于 1 小时吗"}
+  C -- "是" --> Z["跳过本次触发"]
+  C -- "否" --> D["创建 run_log 并置为 STARTED/RUNNING"]
+  D --> E["构造固定窗口 startDate/endDate"]
+  E --> F["按 lastId 分页抓取，curPage 固定为 1"]
+  F --> G["落 sync_run_batch 与 sync_run_detail 快照"]
+  G --> H["发送 Kafka 消息"]
+  H --> I{"是否还有下一页"}
+  I -- "是" --> F
+  I -- "否" --> J["置 produce_status=PRODUCED 并推进 checkpoint"]
+  J --> K["消费端按 lastId 区间回查并处理"]
+  K --> L["原子更新明细状态与 run 计数"]
+  L --> M["每批次消费完成后执行 tryFinalize(runId)"]
+  M --> N["SUCCESS 或 PARTIAL_SUCCESS 或 FAILED"]
+      </div>
+
+      <h3>主流程不变式</h3>
+      <ul>
+        <li>必须先提交明细快照，再发送 MQ。</li>
+        <li>生产阶段完成后即可推进 checkpoint（与消费成败解耦）。</li>
+        <li>每个批次消费完成后都要触发一次 <code>tryFinalize(runId)</code>。</li>
+      </ul>
+    </section>
+
+    <section class="card" id="resume-policy">
+      <h2>中断续跑规则（runlog 查询快照）</h2>
+      <ul>
+        <li>触发时先查该任务是否存在 <code>produce_status in (INIT, PRODUCING)</code> 且 <code>heartbeat_time</code> 超过 1 小时的 run。</li>
+        <li>若存在：不新建窗口，直接续跑该 run，使用 <code>query_param_snapshot.startDate/endDate</code> 与 <code>resume_last_id</code> 继续拉取。</li>
+        <li>若不存在：按 checkpoint 创建新 run，<code>resume_mode=NEW</code>。</li>
+        <li>每生产完一批，原子更新 <code>resume_last_id=last_id_to</code>、<code>resume_batch_no=batch_no</code>、<code>heartbeat_time=NOW()</code>。</li>
+        <li>仅当 <code>produce_status=PRODUCED</code> 时推进 checkpoint，避免生产中断导致窗口丢段。</li>
+      </ul>
+
+      <h3>触发阶段选路 SQL（示意）</h3>
+      <pre><code>-- 1) 查可续跑 run（超时且未完成生产）
+SELECT id, query_param_snapshot, resume_last_id, resume_batch_no
+FROM sync_task_run_log
+WHERE task_id = #{taskId}
+  AND run_status IN ('STARTED','RUNNING')
+  AND produce_status IN ('INIT','PRODUCING')
+  AND heartbeat_time &lt; DATE_SUB(NOW(), INTERVAL 1 HOUR)
+ORDER BY id DESC
+LIMIT 1;
+
+-- 2) 命中后接管（fencing token 更新）
+UPDATE sync_task_run_log
+SET owner_instance = #{instanceId},
+    lock_token = #{newLockToken},
+    resume_mode = 'RESUME',
+    heartbeat_time = NOW(),
+    updated_at = NOW()
+WHERE id = #{runId};</code></pre>
+
+      <h3>批次推进断点 SQL（示意）</h3>
+      <pre><code>UPDATE sync_task_run_log
+SET resume_last_id = #{lastIdTo},
+    resume_batch_no = #{batchNo},
+    heartbeat_time = NOW(),
+    updated_at = NOW()
+WHERE id = #{runId}
+  AND lock_token = #{lockToken};</code></pre>
+    </section>
+
+    <section class="card" id="exception-flow">
+      <h2>异常流程图</h2>
+      <div class="mermaid">
+flowchart TD
+  A["收到触发"] --> B{"是否存在 RUNNING 记录"}
+  B -- "是" --> C{"heartbeat 超过 1 小时吗"}
+  C -- "否" --> D["返回 SKIPPED_ACTIVE_RUN"]
+  C -- "是" --> E["创建 RECOVER run 并 fencing 旧生产者"]
+  B -- "否" --> F["进入正常执行"]
+  E --> G["接管未闭合批次或关闭旧 run 为 FAILED"]
+  F --> H["消费阶段出现失败"]
+  H --> I{"失败类型"}
+  I -- "校验失败" --> J["标记 VALIDATION_FAILED，进入失败池"]
+  I -- "系统失败" --> K{"达到上限策略吗"}
+  K -- "否" --> L["标记 SYSTEM_FAILED，等待人工重放"]
+  K -- "是" --> M["人工归档关闭 ARCHIVED_CLOSED"]
+      </div>
+
+      <h3>失败处理规则</h3>
+      <ul>
+        <li><code>VALIDATION_FAILED</code> 默认不自动关闭，需人工重放或人工归档。</li>
+        <li><code>SYSTEM_FAILED</code> 可人工重放；达到策略上限后可归档关闭。</li>
+        <li>归档关闭必须落审计表 <code>sync_detail_archive</code>。</li>
+      </ul>
+    </section>
+
+    <section class="card" id="api-contract">
+      <h2>接口契约</h2>
+
+      <h3>1）触发任务</h3>
+      <pre><code>POST /sync/tasks/{taskId}/trigger
+返回：
+{
+  "code": "OK | SKIPPED_ACTIVE_RUN",
+  "runId": 123456,
+  "message": "..."
+}</code></pre>
+
+      <h3>2）查询运行状态</h3>
+      <pre><code>GET /sync/runs/{runId}
+返回：
+{
+  "runId": 123456,
+  "taskId": 1001,
+  "runStatus": "RUNNING",
+  "produceStatus": "PRODUCED",
+  "consumeStatus": "CONSUMING",
+  "expectedDetailCount": 120000,
+  "successCount": 118900,
+  "validationFailCount": 900,
+  "systemFailCount": 200,
+  "pendingCount": 0
+}</code></pre>
+
+      <h3>3）查询失败池</h3>
+      <pre><code>GET /sync/tasks/{taskId}/failed-pool?status=VALIDATION_FAILED,SYSTEM_FAILED&pageNo=1&pageSize=50</code></pre>
+
+      <h3>4）人工重放</h3>
+      <pre><code>POST /sync/details/replay
+{
+  "detailIds": [11, 12, 13]
+}</code></pre>
+
+      <h3>5）归档关闭</h3>
+      <pre><code>POST /sync/details/archive-close
+{
+  "detailIds": [21, 22],
+  "reason": "源数据长期无效，确认关闭"
+}</code></pre>
+
+      <h3>Kafka 消息结构</h3>
+      <pre><code>{
+  "runId": 123456,
+  "taskId": 1001,
+  "batchNo": 18,
+  "queryParam": {
+    "curPage": 1,
+    "pageSize": 100,
+    "startDate": "2020-01-01 00:00:00",
+    "endDate": "2025-01-01 00:00:00",
+    "lastId": 200010
+  },
+  "lastIdTo": 200109,
+  "expectedCount": 100,
+  "lockToken": "fence-20250226-abcdef",
+  "traceId": "trace-...",
+  "endBatch": false
+}</code></pre>
+      <p class="muted"><code>endBatch</code> 仅作为提示字段，可用于“优先触发 tryFinalize”，不参与终态判定条件。</p>
+    </section>
+
+    <section class="card" id="compensation-flow">
+      <h2>补偿流程</h2>
+      <ol>
+        <li>运维或业务人员按任务、状态、失败码、时间范围查询失败池。</li>
+        <li>执行重放时，将选中明细置为 <code>CONSUMING</code>，并增加 <code>replay_count</code>。</li>
+        <li>重放成功后置 <code>SUCCESS</code>，并回填 <code>entity_id</code>。</li>
+        <li>重放失败则更新失败码与失败原因，返回失败池。</li>
+        <li>归档关闭时写 <code>sync_detail_archive</code>，并将明细置 <code>ARCHIVED_CLOSED</code>。</li>
+        <li>每次批次消费收尾都执行 <code>tryFinalize(runId)</code>，成功更新 1 行即表示终态闭合。</li>
+      </ol>
+
+      <h3>计数更新策略</h3>
+      <pre><code>同一事务内进行：
+1) 更新 detail_status
+2) 原子增减 run_log 计数（SQL increment/decrement）
+3) 必要时更新 batch_status
+
+禁止在应用内先读后写覆盖计数，避免并发丢计数。</code></pre>
+
+      <h3>消费端即时终态收敛 SQL（推荐）</h3>
+      <pre><code>-- 每个批次消费完成后执行，返回影响行数=1 代表本次成功闭合终态
+UPDATE sync_task_run_log
+SET run_status = CASE
+      WHEN validation_fail_count = 0 AND system_fail_count = 0 THEN 'SUCCESS'
+      ELSE 'PARTIAL_SUCCESS'
+    END,
+    consume_status = CASE
+      WHEN validation_fail_count = 0 AND system_fail_count = 0 THEN 'DONE'
+      ELSE 'PARTIAL'
+    END,
+    updated_at = NOW()
+WHERE id = #{runId}
+  AND produce_status = 'PRODUCED'
+  AND finished_batch_count = expected_batch_count
+  AND pending_count = 0
+  AND run_status IN ('STARTED','RUNNING');</code></pre>
+
+      <p class="muted">说明：该 SQL 必须在批次状态“首次闭合”后触发，避免重复消费导致的重复计数。</p>
+    </section>
+
+    <section class="card" id="test-cases">
+      <h2>测试用例</h2>
+      <table>
+        <thead><tr><th>编号</th><th>场景</th><th>预期结果</th></tr></thead>
+        <tbody>
+          <tr><td>T1</td><td>首次执行从 1970 起全量拉取</td><td>生产完成后 checkpoint 推进到窗口结束与最大 lastId</td></tr>
+          <tr><td>T2</td><td>1小时内重复点击触发</td><td>返回 <code>SKIPPED_ACTIVE_RUN</code>，不创建新 run</td></tr>
+          <tr><td>T3</td><td>生产完成后消费部分失败</td><td>run 收敛为 <code>PARTIAL_SUCCESS</code>，下次增量仍从 checkpoint 开始</td></tr>
+          <tr><td>T4</td><td>多实例消费乱序（尾批先到）</td><td>不误判终态，批次完成后的 tryFinalize 最终收敛正确</td></tr>
+          <tr><td>T5</td><td>消费回查缺失部分 source_id</td><td>缺失项标记 <code>SYSTEM_FAILED</code>，可人工重放</td></tr>
+          <tr><td>T6</td><td>校验失败后人工修复并重放</td><td>明细转 <code>SUCCESS</code> 并回填本地实体主键</td></tr>
+          <tr><td>T7</td><td>系统失败达到策略上限</td><td>允许归档关闭，且有完整审计记录</td></tr>
+          <tr><td>T8</td><td>Redis 锁失效后旧实例继续写</td><td>旧实例因 fencing token 校验失败被拒绝</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="card" id="ops-metrics">
+      <h2>运维指标与告警</h2>
+      <h3>核心指标</h3>
+      <ul>
+        <li><code>active_run_count</code></li>
+        <li><code>run_heartbeat_lag_seconds</code></li>
+        <li><code>pending_detail_count</code></li>
+        <li><code>validation_fail_rate</code></li>
+        <li><code>system_fail_rate</code></li>
+        <li><code>archive_close_rate</code></li>
+        <li><code>try_finalize_success_count</code></li>
+        <li><code>try_finalize_noop_count</code></li>
+        <li><code>checkpoint_delay_seconds</code></li>
+      </ul>
+
+      <h3>告警策略</h3>
+      <ul>
+        <li>RUNNING 记录心跳超时。</li>
+        <li>待处理明细持续积压超过阈值。</li>
+        <li><code>tryFinalize</code> 长时间无成功闭环且 pending 不下降。</li>
+        <li>校验失败率或系统失败率高于基线。</li>
+      </ul>
+    </section>
+
+    <section class="card" id="confirmed-decisions">
+      <h2>已确认决策</h2>
+      <ul>
+        <li>优先续跑超时未完成 run（按 runlog 快照与断点），否则按 checkpoint 开新窗口。</li>
+        <li>生产完成后允许推进 checkpoint，消费失败走补偿链路。</li>
+        <li>run 终态由消费端批次收尾时的 <code>tryFinalize</code> 条件更新统一归并。</li>
+        <li>失败补偿以人工重放为主，支持归档关闭并保留审计。</li>
+        <li>消费端按 lastId 区间回查，并与已落明细快照做对齐。</li>
+      </ul>
+    </section>
+
+    <section class="card" id="config-defaults">
+      <h2>可配置项默认值</h2>
+      <table>
+        <thead><tr><th>配置项</th><th>默认值</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>activeRunHeartbeatThresholdMinutes</code></td><td>60</td><td>活跃 run 跳过阈值</td></tr>
+          <tr><td><code>producerPageSize</code></td><td>100</td><td>与上游分页契约一致</td></tr>
+          <tr><td><code>enableFinalizeOnBatchDone</code></td><td>true</td><td>批次消费结束后立即尝试终态收敛</td></tr>
+          <tr><td><code>manualReplayBatchSize</code></td><td>200</td><td>人工重放的批量控制</td></tr>
+          <tr><td><code>systemFailArchiveCloseEnabled</code></td><td>true</td><td>系统失败可归档关闭</td></tr>
+          <tr><td><code>maxReplayAttemptsBeforeArchiveClose</code></td><td>5</td><td>超上限后可执行归档</td></tr>
+          <tr><td><code>fencingTokenTtlSeconds</code></td><td>5400</td><td>应大于心跳阈值</td></tr>
+        </tbody>
+      </table>
+      <p>
+        <span class="ok">SUCCESS</span>：无待处理且无失败。
+        <span class="warn">PARTIAL_SUCCESS</span>：无待处理但存在失败。
+        <span class="err">FAILED</span>：生产不可恢复失败或接管失败。
+      </p>
+    </section>
+  </div>
+</body>
+</html>
